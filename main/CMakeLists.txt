@@ -1,2 +1,3 @@
-idf_component_register(SRCS "blink.c"
-                       INCLUDE_DIRS ".")
+idf_component_register(SRCS "modbus_slave.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES driver esp-modbus)

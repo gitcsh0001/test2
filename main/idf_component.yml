@@ -1,6 +1,6 @@
-## Managed component dependencies for the WS2812 blink example.
-## See https://components.espressif.com/components/espressif/led_strip
+## Managed component dependencies for the Modbus slave example.
+## See https://components.espressif.com/components/espressif/esp-modbus
 dependencies:
-  espressif/led_strip: "^2.5.3"
+  espressif/esp-modbus: "==2.1.2"
   idf:
-    version: ">=5.0"
+    version: ">=6.0"

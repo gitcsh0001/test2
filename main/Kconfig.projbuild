@@ -1,28 +1,29 @@
-menu "Blink Configuration"
+menu "Modbus Slave Configuration"
 
-    config BLINK_GPIO
-        int "WS2812 data GPIO number"
-        range 0 48
-        default 8
-        help
-            GPIO number (IOxx) connected to the WS2812 (NeoPixel) data line.
-
-            Many ESP32-C3/S3 DevKit boards have an on-board WS2812 on GPIO8.
-            Classic ESP32 DevKits without an addressable LED can use any
-            free GPIO with an external WS2812.
-
-    config BLINK_LED_COUNT
-        int "Number of WS2812 LEDs"
-        range 1 256
+    config MB_SLAVE_ADDR
+        int "Modbus slave address (UID)"
+        range 1 247
         default 1
         help
-            Number of WS2812 LEDs in the strip / ring connected to BLINK_GPIO.
+            Modbus slave (unit) address used by this device on the RTU bus.
 
-    config BLINK_PERIOD_MS
-        int "Blink period in milliseconds"
-        range 10 10000
-        default 1000
+    config MB_SLAVE_UART_PORT_NUM
+        int "UART port number"
+        range 0 2
+        default 1
         help
-            How long the LED stays on (and off) for each blink cycle, in ms.
+            UART port number used for the Modbus RTU serial connection.
+
+            Note: the actual TXD / RXD / RTS pins are configured under
+            "Component config -> Modbus configuration", provided by the
+            esp-modbus component.
+
+    config MB_SLAVE_UART_BAUD
+        int "UART baud rate"
+        range 1200 921600
+        default 115200
+        help
+            Baud rate of the Modbus RTU serial connection. Must match the
+            Modbus master configuration.
 
 endmenu
