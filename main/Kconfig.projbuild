@@ -1,14 +1,22 @@
 menu "Blink Configuration"
 
     config BLINK_GPIO
-        int "Blink GPIO number"
+        int "WS2812 data GPIO number"
         range 0 48
-        default 2
+        default 8
         help
-            GPIO number (IOxx) connected to the LED.
+            GPIO number (IOxx) connected to the WS2812 (NeoPixel) data line.
 
-            Many ESP32 DevKit boards have an on-board LED on GPIO2.
-            Some boards (e.g. ESP32-C3/S3 DevKits) use GPIO8 instead.
+            Many ESP32-C3/S3 DevKit boards have an on-board WS2812 on GPIO8.
+            Classic ESP32 DevKits without an addressable LED can use any
+            free GPIO with an external WS2812.
+
+    config BLINK_LED_COUNT
+        int "Number of WS2812 LEDs"
+        range 1 256
+        default 1
+        help
+            Number of WS2812 LEDs in the strip / ring connected to BLINK_GPIO.
 
     config BLINK_PERIOD_MS
         int "Blink period in milliseconds"
