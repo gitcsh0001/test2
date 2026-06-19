@@ -1,0 +1,20 @@
+menu "Blink Configuration"
+
+    config BLINK_GPIO
+        int "Blink GPIO number"
+        range 0 48
+        default 2
+        help
+            GPIO number (IOxx) connected to the LED.
+
+            Many ESP32 DevKit boards have an on-board LED on GPIO2.
+            Some boards (e.g. ESP32-C3/S3 DevKits) use GPIO8 instead.
+
+    config BLINK_PERIOD_MS
+        int "Blink period in milliseconds"
+        range 10 10000
+        default 1000
+        help
+            How long the LED stays on (and off) for each blink cycle, in ms.
+
+endmenu
