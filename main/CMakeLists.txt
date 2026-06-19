@@ -1,4 +1,5 @@
-idf_component_register(SRCS "modbus_slave.c"
+idf_component_register(SRCS "modbus_slave.c" "web_server.c"
                        INCLUDE_DIRS "."
                        REQUIRES driver esp-modbus esp_netif esp_event
-                                nvs_flash protocol_examples_common)
+                                nvs_flash esp_http_server
+                                protocol_examples_common)

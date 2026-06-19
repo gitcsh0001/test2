@@ -1,19 +1,20 @@
 menu "Modbus Slave Configuration"
 
+    comment "These are factory defaults; all values can be changed at"
+    comment "runtime from the web UI and are then persisted in NVS."
+
     config MB_SLAVE_ADDR
-        int "Modbus slave address (UID)"
+        int "Default Modbus slave address (UID)"
         range 1 247
         default 1
-        help
-            Modbus slave (unit) address used by this device.
 
     choice MB_SLAVE_INIT_MODE
-        prompt "Initial communication mode (at boot)"
+        prompt "Default communication mode"
         default MB_SLAVE_INIT_RTU
         help
-            Mode the slave starts in. At runtime it can be hot-switched
-            between RTU and TCP with the mode-switch button; both transports
-            are always compiled in.
+            Mode used on first boot (before any web configuration is saved).
+            At runtime the web UI can switch between RTU and TCP and edit all
+            parameters; both transports are always compiled in.
 
         config MB_SLAVE_INIT_RTU
             bool "Modbus RTU (serial)"
@@ -21,44 +22,29 @@ menu "Modbus Slave Configuration"
             bool "Modbus TCP (network)"
     endchoice
 
-    config MB_SWITCH_GPIO
-        int "Mode switch button GPIO"
-        range 0 48
-        default 0
-        help
-            GPIO connected to a momentary button. A press hot-switches the
-            slave between RTU and TCP. GPIO0 is the on-board BOOT button on
-            most ESP32 DevKits (active low).
-
-    comment "--- Modbus RTU options ---"
+    comment "--- RTU defaults ---"
 
     config MB_SLAVE_UART_PORT_NUM
-        int "UART port number"
+        int "Default UART port number"
         range 0 2
         default 1
         help
-            UART port number used for the Modbus RTU serial connection.
-
-            Note: the actual TXD / RXD / RTS pins are configured under
-            "Component config -> Modbus configuration", provided by the
-            esp-modbus component.
+            TXD / RXD / RTS pins are set under
+            "Component config -> Modbus configuration".
 
     config MB_SLAVE_UART_BAUD
-        int "UART baud rate"
+        int "Default UART baud rate"
         range 1200 921600
         default 115200
-        help
-            Baud rate of the Modbus RTU serial connection.
 
-    comment "--- Modbus TCP options ---"
+    comment "--- TCP defaults ---"
 
     config MB_SLAVE_TCP_PORT
-        int "Modbus TCP port"
+        int "Default Modbus TCP port"
         range 1 65535
         default 502
         help
-            TCP port the Modbus TCP slave listens on (standard port is 502).
-            Wi-Fi / Ethernet credentials are configured under
+            Wi-Fi / Ethernet credentials are set under
             "Example Connection Configuration".
 
 endmenu
