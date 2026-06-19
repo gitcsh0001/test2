@@ -5,7 +5,32 @@ menu "Modbus Slave Configuration"
         range 1 247
         default 1
         help
-            Modbus slave (unit) address used by this device on the RTU bus.
+            Modbus slave (unit) address used by this device.
+
+    choice MB_SLAVE_INIT_MODE
+        prompt "Initial communication mode (at boot)"
+        default MB_SLAVE_INIT_RTU
+        help
+            Mode the slave starts in. At runtime it can be hot-switched
+            between RTU and TCP with the mode-switch button; both transports
+            are always compiled in.
+
+        config MB_SLAVE_INIT_RTU
+            bool "Modbus RTU (serial)"
+        config MB_SLAVE_INIT_TCP
+            bool "Modbus TCP (network)"
+    endchoice
+
+    config MB_SWITCH_GPIO
+        int "Mode switch button GPIO"
+        range 0 48
+        default 0
+        help
+            GPIO connected to a momentary button. A press hot-switches the
+            slave between RTU and TCP. GPIO0 is the on-board BOOT button on
+            most ESP32 DevKits (active low).
+
+    comment "--- Modbus RTU options ---"
 
     config MB_SLAVE_UART_PORT_NUM
         int "UART port number"
@@ -23,7 +48,17 @@ menu "Modbus Slave Configuration"
         range 1200 921600
         default 115200
         help
-            Baud rate of the Modbus RTU serial connection. Must match the
-            Modbus master configuration.
+            Baud rate of the Modbus RTU serial connection.
+
+    comment "--- Modbus TCP options ---"
+
+    config MB_SLAVE_TCP_PORT
+        int "Modbus TCP port"
+        range 1 65535
+        default 502
+        help
+            TCP port the Modbus TCP slave listens on (standard port is 502).
+            Wi-Fi / Ethernet credentials are configured under
+            "Example Connection Configuration".
 
 endmenu

@@ -1,27 +1,45 @@
 /*
- * ESP32 Modbus RTU slave example (ESP-IDF 6.0, esp-modbus v2.1.2)
+ * ESP32 Modbus slave example (ESP-IDF 6.0, esp-modbus v2.1.2)
  *
- * Implements a serial Modbus RTU slave exposing four parameter areas:
+ * Supports BOTH Modbus RTU (serial) and Modbus TCP (network) in a single
+ * firmware, with RUNTIME HOT-SWITCHING between them: a button press tears
+ * down the active slave and rebuilds it on the other transport, without a
+ * reboot or reflash.
+ *
+ * The boot mode and switch button GPIO are set via
+ * `idf.py menuconfig` -> "Modbus Slave Configuration".
+ *
+ * Both modes expose four parameter areas:
  *   - Holding registers  (read / write)   : 10 x uint16
  *   - Input registers    (read only)       : 10 x uint16
  *   - Coils              (read / write)     : 16 bits
  *   - Discrete inputs    (read only)        : 16 bits
- *
- * The slave address, UART port and baud rate are configured via
- * `idf.py menuconfig` -> "Modbus Slave Configuration". The UART pins are
- * configured by the esp-modbus component under
- * "Component config -> Modbus configuration".
  */
 
+#include <stdbool.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "mbcontroller.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "protocol_examples_common.h"
 
 static const char *TAG = "mb_slave";
+
+#define SWITCH_GPIO ((gpio_num_t)CONFIG_MB_SWITCH_GPIO)
+
+typedef enum {
+    MODE_RTU = 0,
+    MODE_TCP,
+} slave_mode_t;
+
+static const char *mode_str(slave_mode_t m) { return m == MODE_RTU ? "RTU" : "TCP"; }
 
 /* ---- Register storage ------------------------------------------------- */
 
@@ -35,8 +53,10 @@ static uint16_t s_input_regs[MB_INPUT_CNT];
 static uint8_t  s_coils[MB_COIL_BYTES];
 static uint8_t  s_discrete[MB_DISCRETE_BYTES];
 
-/* Modbus slave controller handle (v2.x API). */
+/* Modbus slave controller handle (v2.x API) and current transport. */
 static void *s_mb_handle = NULL;
+static slave_mode_t s_current_mode;
+static bool s_net_ready = false;
 
 /* ---- Helpers ---------------------------------------------------------- */
 
@@ -52,36 +72,8 @@ static void set_descriptor(mb_param_type_t type, uint16_t offset,
     ESP_ERROR_CHECK(mbc_slave_set_descriptor(s_mb_handle, area));
 }
 
-static const char *event_to_str(mb_event_group_t event)
+static void register_areas_and_seed(void)
 {
-    if (event & MB_EVENT_HOLDING_REG_WR) return "HOLDING WR";
-    if (event & MB_EVENT_HOLDING_REG_RD) return "HOLDING RD";
-    if (event & MB_EVENT_INPUT_REG_RD)   return "INPUT RD";
-    if (event & MB_EVENT_COILS_WR)       return "COILS WR";
-    if (event & MB_EVENT_COILS_RD)       return "COILS RD";
-    if (event & MB_EVENT_DISCRETE_RD)    return "DISCRETE RD";
-    return "OTHER";
-}
-
-/* ---- Init ------------------------------------------------------------- */
-
-static void modbus_slave_init(void)
-{
-    mb_communication_info_t comm_info = {
-        .ser_opts = {
-            .port      = CONFIG_MB_SLAVE_UART_PORT_NUM,
-            .mode      = MB_RTU,
-            .baudrate  = CONFIG_MB_SLAVE_UART_BAUD,
-            .parity    = MB_PARITY_NONE,
-            .uid       = CONFIG_MB_SLAVE_ADDR,
-            .data_bits = UART_DATA_8_BITS,
-            .stop_bits = UART_STOP_BITS_1,
-        },
-    };
-
-    ESP_ERROR_CHECK(mbc_slave_create_serial(&comm_info, &s_mb_handle));
-
-    /* Register the four parameter areas. */
     set_descriptor(MB_PARAM_HOLDING,  0, (void *)s_holding_regs, sizeof(s_holding_regs));
     set_descriptor(MB_PARAM_INPUT,    0, (void *)s_input_regs,   sizeof(s_input_regs));
     set_descriptor(MB_PARAM_COIL,     0, (void *)s_coils,        sizeof(s_coils));
@@ -95,38 +87,143 @@ static void modbus_slave_init(void)
         s_holding_regs[i] = i;
     }
     s_discrete[0] = 0xA5;
+}
 
+/* ---- Network (lazy, only needed for TCP) ------------------------------ */
+
+static void ensure_network(void)
+{
+    if (s_net_ready) {
+        return;
+    }
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    /* Brings up Wi-Fi / Ethernet using "Example Connection Configuration". */
+    ESP_ERROR_CHECK(example_connect());
+
+    s_net_ready = true;
+}
+
+/* ---- Transport-specific controller creation --------------------------- */
+
+static void slave_create_rtu(void)
+{
+    mb_communication_info_t comm_info = {
+        .ser_opts = {
+            .port      = CONFIG_MB_SLAVE_UART_PORT_NUM,
+            .mode      = MB_RTU,
+            .baudrate  = CONFIG_MB_SLAVE_UART_BAUD,
+            .parity    = MB_PARITY_NONE,
+            .uid       = CONFIG_MB_SLAVE_ADDR,
+            .data_bits = UART_DATA_8_BITS,
+            .stop_bits = UART_STOP_BITS_1,
+        },
+    };
+    ESP_ERROR_CHECK(mbc_slave_create_serial(&comm_info, &s_mb_handle));
+}
+
+static void slave_create_tcp(void)
+{
+    ensure_network();
+
+    mb_communication_info_t comm_info = {
+        .tcp_opts = {
+            .mode          = MB_TCP,
+            .port          = CONFIG_MB_SLAVE_TCP_PORT,
+            .addr_type     = MB_IPV4,
+            .ip_addr_table = NULL,                 /* accept any master */
+            .ip_netif_ptr  = (void *)get_example_netif(),
+            .uid           = CONFIG_MB_SLAVE_ADDR,
+        },
+    };
+    ESP_ERROR_CHECK(mbc_slave_create_tcp(&comm_info, &s_mb_handle));
+}
+
+/* ---- Start / stop / hot-switch ---------------------------------------- */
+
+static void slave_start(slave_mode_t mode)
+{
+    if (mode == MODE_RTU) {
+        slave_create_rtu();
+    } else {
+        slave_create_tcp();
+    }
+
+    register_areas_and_seed();
     ESP_ERROR_CHECK(mbc_slave_start(s_mb_handle));
 
-    ESP_LOGI(TAG, "Modbus RTU slave started: addr=%d, uart=%d, baud=%d",
-             CONFIG_MB_SLAVE_ADDR, CONFIG_MB_SLAVE_UART_PORT_NUM,
-             CONFIG_MB_SLAVE_UART_BAUD);
+    s_current_mode = mode;
+    ESP_LOGI(TAG, "Modbus slave running in %s mode (addr=%d)",
+             mode_str(mode), CONFIG_MB_SLAVE_ADDR);
 }
+
+static void slave_stop(void)
+{
+    if (s_mb_handle) {
+        ESP_ERROR_CHECK(mbc_slave_delete(s_mb_handle));
+        s_mb_handle = NULL;
+    }
+}
+
+static void slave_switch(slave_mode_t mode)
+{
+    if (mode == s_current_mode) {
+        return;
+    }
+    ESP_LOGW(TAG, "Hot-switching %s -> %s ...",
+             mode_str(s_current_mode), mode_str(mode));
+    slave_stop();
+    slave_start(mode);
+}
+
+/* ---- Mode-switch button ----------------------------------------------- */
+
+static void switch_button_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << CONFIG_MB_SWITCH_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    ESP_LOGI(TAG, "Mode switch button on GPIO%d (press to toggle RTU/TCP)",
+             CONFIG_MB_SWITCH_GPIO);
+}
+
+/* ---- Application ------------------------------------------------------ */
 
 void app_main(void)
 {
-    modbus_slave_init();
+    switch_button_init();
 
-    /* All read/write events from the master are flagged here; wait for any
-     * of them, then report which area was accessed. */
-    const mb_event_group_t wait_mask =
-        MB_EVENT_HOLDING_REG_WR | MB_EVENT_HOLDING_REG_RD |
-        MB_EVENT_INPUT_REG_RD |
-        MB_EVENT_COILS_WR | MB_EVENT_COILS_RD |
-        MB_EVENT_DISCRETE_RD;
+    slave_mode_t init_mode =
+#if CONFIG_MB_SLAVE_INIT_TCP
+        MODE_TCP;
+#else
+        MODE_RTU;
+#endif
+    slave_start(init_mode);
 
-    mb_param_info_t reg_info;
-
+    /* Supervisor loop: debounce the button (active low) and hot-switch on a
+     * falling edge. The esp-modbus stack services master requests in the
+     * background, so no blocking event loop is required here. */
+    int last_level = 1;
     while (1) {
-        mb_event_group_t event = mbc_slave_check_event(s_mb_handle, wait_mask);
-
-        if (mbc_slave_get_param_info(s_mb_handle, &reg_info,
-                                     10 / portTICK_PERIOD_MS) == ESP_OK) {
-            ESP_LOGI(TAG, "%s: offset=%u, size=%u, addr=%p",
-                     event_to_str(event),
-                     (unsigned)reg_info.mb_offset,
-                     (unsigned)reg_info.size,
-                     reg_info.address);
+        int level = gpio_get_level(SWITCH_GPIO);
+        if (last_level == 1 && level == 0) {
+            slave_switch(s_current_mode == MODE_RTU ? MODE_TCP : MODE_RTU);
         }
+        last_level = level;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
