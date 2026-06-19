@@ -68,6 +68,7 @@ static void set_descriptor(mb_param_type_t type, uint16_t offset,
         .start_offset = offset,
         .address = address,
         .size = size,
+        .access = MB_ACCESS_RW,
     };
     ESP_ERROR_CHECK(mbc_slave_set_descriptor(s_mb_handle, area));
 }
