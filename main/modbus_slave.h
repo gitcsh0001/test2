@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -32,6 +33,10 @@ void modbus_get_config(slave_cfg_t *out);
 /* Atomically stop the running slave, adopt *cfg, restart on the selected
  * transport and persist to NVS. Safe to call from the HTTP task. */
 esp_err_t modbus_apply_config(const slave_cfg_t *cfg);
+
+/* True while the device has network connectivity (has an IP address).
+ * Reflects Wi-Fi link state for the TCP transport and web UI. */
+bool modbus_net_is_up(void);
 
 #ifdef __cplusplus
 }

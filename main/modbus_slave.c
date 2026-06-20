@@ -21,6 +21,7 @@
 #include "nvs.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
 #include "driver/uart.h"
 #include "mbcontroller.h"
 #include "mb_types.h"          /* mb_err_enum_t, mb_reg_mode_enum_t, exceptions */
@@ -47,6 +48,15 @@ static uint16_t s_holding_regs[MB_HOLDING_CNT];
 static void           *s_mb_handle = NULL;
 static slave_cfg_t      s_cfg;
 static SemaphoreHandle_t s_lock;
+static volatile bool    s_net_up = false;
+
+/* Slave response timeout for the TCP transport (ms). */
+#define MB_TCP_RESPONSE_TOUT_MS  1000
+
+bool modbus_net_is_up(void)
+{
+    return s_net_up;
+}
 
 /* ---- Config defaults / persistence ------------------------------------ */
 
@@ -293,12 +303,13 @@ static void slave_create(const slave_cfg_t *c)
     } else {
         mb_communication_info_t info = {
             .tcp_opts = {
-                .mode          = MB_TCP,
-                .port          = c->tcp_port,
-                .addr_type     = MB_IPV4,
-                .ip_addr_table = NULL,
-                .ip_netif_ptr  = (void *)get_example_netif(),
-                .uid           = c->slave_addr,
+                .mode             = MB_TCP,
+                .port             = c->tcp_port,
+                .addr_type        = MB_IPV4,
+                .ip_addr_table    = NULL,
+                .ip_netif_ptr     = (void *)get_example_netif(),
+                .uid              = c->slave_addr,
+                .response_tout_ms = MB_TCP_RESPONSE_TOUT_MS,
             },
         };
         ESP_ERROR_CHECK(mbc_slave_create_tcp(&info, &s_mb_handle));
@@ -353,6 +364,20 @@ esp_err_t modbus_apply_config(const slave_cfg_t *cfg)
 
 /* ---- Boot ------------------------------------------------------------- */
 
+/* Track link state so the TCP transport health is visible (web UI / logs).
+ * example_connect() already drives Wi-Fi auto-reconnect; we only observe it. */
+static void net_event_handler(void *arg, esp_event_base_t base,
+                              int32_t id, void *data)
+{
+    if (base == IP_EVENT && (id == IP_EVENT_STA_GOT_IP || id == IP_EVENT_ETH_GOT_IP)) {
+        s_net_up = true;
+        ESP_LOGI(TAG, "Network up (got IP)");
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_net_up = false;
+        ESP_LOGW(TAG, "Network down (Wi-Fi disconnected), reconnecting...");
+    }
+}
+
 static void network_connect(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -364,8 +389,17 @@ static void network_connect(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    /* Wi-Fi / Ethernet via "Example Connection Configuration". */
+
+    /* Observe link state (registered before connecting so we catch events). */
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
+                                               net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                               net_event_handler, NULL));
+
+    /* Wi-Fi / Ethernet via "Example Connection Configuration".
+     * Blocks until connected; auto-reconnects forever afterwards. */
     ESP_ERROR_CHECK(example_connect());
+    s_net_up = true;
 }
 
 void app_main(void)

@@ -58,7 +58,7 @@ static const char HTML_PAGE[] =
 "function tg(){rtu.style.display=mode.value=='rtu'?'':'none';"
 "tcp.style.display=mode.value=='tcp'?'':'none';}"
 "function load(){fetch('/api/status').then(r=>r.json()).then(s=>{"
-"cur.textContent=s.mode.toUpperCase()+' addr='+s.addr;"
+"cur.textContent=s.mode.toUpperCase()+' addr='+s.addr+(s.online?' [online]':' [offline]');"
 "mode.value=s.mode;addr.value=s.addr;uart.value=s.uart;baud.value=s.baud;"
 "parity.value=s.parity;databits.value=s.databits;stopbits.value=s.stopbits;"
 "tcpport.value=s.tcpport;tg();});}"
@@ -83,13 +83,15 @@ static esp_err_t status_get(httpd_req_t *req)
     slave_cfg_t c;
     modbus_get_config(&c);
 
-    char buf[256];
+    char buf[280];
     int n = snprintf(buf, sizeof(buf),
         "{\"mode\":\"%s\",\"addr\":%u,\"uart\":%u,\"baud\":%u,"
-        "\"parity\":%u,\"databits\":%u,\"stopbits\":%u,\"tcpport\":%u}",
+        "\"parity\":%u,\"databits\":%u,\"stopbits\":%u,\"tcpport\":%u,"
+        "\"online\":%d}",
         c.mode == MODE_RTU ? "rtu" : "tcp",
         c.slave_addr, c.uart_port, (unsigned)c.baudrate,
-        c.parity, c.data_bits, c.stop_bits, c.tcp_port);
+        c.parity, c.data_bits, c.stop_bits, c.tcp_port,
+        modbus_net_is_up() ? 1 : 0);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, n);

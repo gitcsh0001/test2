@@ -65,11 +65,27 @@ esp-modbus 提供**公开** API `mbc_set_handler()` / `mbc_get_handler()`,可替
 | GET | `/api/status` | 返回当前配置 JSON |
 | POST | `/api/config` | 提交新配置(url-encoded),触发热切换 |
 
-`/api/status` 返回示例:
+`/api/status` 返回示例(`online` 为当前联网状态):
 
 ```json
-{"mode":"rtu","addr":1,"uart":1,"baud":115200,"parity":0,"databits":8,"stopbits":1,"tcpport":502}
+{"mode":"rtu","addr":1,"uart":1,"baud":115200,"parity":0,"databits":8,"stopbits":1,"tcpport":502,"online":1}
 ```
+
+## TCP 连接层健壮性
+
+异常码经 TCP 返回是没问题的(协议栈自动剥/套 MBAP 头,handler 收到的始终是纯 PDU)。
+针对**连接层**的异常(断连、死连接、并发、掉线),本项目做了如下加固:
+
+| 措施 | 配置/代码 | 作用 |
+|------|-----------|------|
+| 最大并发连接 | `CONFIG_FMB_TCP_PORT_MAX_CONN=5` | 限制同时连接的主站数 |
+| 空闲连接超时 | `CONFIG_FMB_TCP_CONNECTION_TOUT_SEC=20` | 回收长时间空闲的连接 |
+| TCP keep-alive | `CONFIG_FMB_TCP_KEEP_ALIVE_TOUT_SEC=4` | 探测并清理死连接,避免 socket 泄漏 |
+| Wi-Fi 无限重连 | `CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=-1` | 掉线后一直重连,保持从站可达 |
+| 从站响应超时 | `tcp_opts.response_tout_ms=1000` | 限制响应等待时间 |
+| 联网状态监测 | `net_event_handler` + `modbus_net_is_up()` | 跟踪 IP/断连事件,网页显示 online/offline |
+
+以上 Kconfig 值写在 **`sdkconfig.defaults`**,首次构建自动生效;可按需 `menuconfig` 调整。
 
 ## 架构说明
 
