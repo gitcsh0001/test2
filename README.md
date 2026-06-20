@@ -15,7 +15,7 @@
   - 点击「Apply & hot-switch」→ 后台拆掉当前从站、用新参数重建并重启
 - **热切换**:`mbc_slave_delete()` → `mbc_slave_create_serial/tcp()` → `mbc_slave_start()`,无需重启/重新烧录
 - **持久化**:配置写入 NVS,重启后自动加载
-- 暴露 4 类寄存器区:保持寄存器、输入寄存器、线圈、离散输入
+- 暴露 **保持寄存器(Holding Registers)** 1 类区:10 × uint16,读/写,起始偏移 0
 
 ## HTTP 接口
 

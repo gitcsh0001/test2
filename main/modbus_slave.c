@@ -38,14 +38,8 @@ static const char *mode_str(slave_mode_t m) { return m == MODE_RTU ? "RTU" : "TC
 /* ---- Register storage ------------------------------------------------- */
 
 #define MB_HOLDING_CNT   10
-#define MB_INPUT_CNT     10
-#define MB_COIL_BYTES     2
-#define MB_DISCRETE_BYTES 2
 
 static uint16_t s_holding_regs[MB_HOLDING_CNT];
-static uint16_t s_input_regs[MB_INPUT_CNT];
-static uint8_t  s_coils[MB_COIL_BYTES];
-static uint8_t  s_discrete[MB_DISCRETE_BYTES];
 
 /* ---- State ------------------------------------------------------------ */
 
@@ -136,21 +130,14 @@ static void set_descriptor(mb_param_type_t type, uint16_t offset,
 
 static void register_descriptors(void)
 {
-    set_descriptor(MB_PARAM_HOLDING,  0, (void *)s_holding_regs, sizeof(s_holding_regs));
-    set_descriptor(MB_PARAM_INPUT,    0, (void *)s_input_regs,   sizeof(s_input_regs));
-    set_descriptor(MB_PARAM_COIL,     0, (void *)s_coils,        sizeof(s_coils));
-    set_descriptor(MB_PARAM_DISCRETE, 0, (void *)s_discrete,     sizeof(s_discrete));
+    set_descriptor(MB_PARAM_HOLDING, 0, (void *)s_holding_regs, sizeof(s_holding_regs));
 }
 
 static void seed_values(void)
 {
-    for (int i = 0; i < MB_INPUT_CNT; i++) {
-        s_input_regs[i] = 0x1000 + i;
-    }
     for (int i = 0; i < MB_HOLDING_CNT; i++) {
         s_holding_regs[i] = i;
     }
-    s_discrete[0] = 0xA5;
 }
 
 static void slave_create(const slave_cfg_t *c)
