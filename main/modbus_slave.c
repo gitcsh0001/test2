@@ -141,28 +141,102 @@ static void seed_values(void)
     }
 }
 
-/* ---- Custom holding-register callback ---------------------------------
+/* ---- Custom holding-register handling ---------------------------------
  *
- * esp-modbus declares mbc_reg_holding_slave_cb() as a WEAK symbol, so this
- * strong definition overrides the library default at link time. It gives us
- * full control over every master read/write of the holding area: we can
- * validate values, enforce read-only registers and return Modbus exception
- * codes to the master.
+ * Two complementary customization mechanisms are used:
  *
- * Exception codes reachable from this callback (esp-modbus v2.1.2 maps the
- * returned mb_err_enum_t via mb_error_to_exception()):
- *     return MB_ENOERR     -> 0x00  OK
- *     return MB_ENOREG     -> 0x02  Illegal Data Address
- *     return MB_ETIMEDOUT  -> 0x06  Slave Busy
- *     return <other>       -> 0x04  Slave Device Failure
- * Note: 0x03 (Illegal Data Value) is NOT reachable from a register callback
- * in this version; producing it would require replacing the whole function
- * handler via the (private) mbs_set_handler() API.
+ * 1) WEAK callback override (mbc_reg_holding_slave_cb): esp-modbus declares
+ *    the default register callback as a weak symbol, so the strong definition
+ *    below replaces it at link time. It performs the actual memory transfer
+ *    and a bounds check (-> 0x02 Illegal Data Address). Note that a register
+ *    callback can only return mb_err_enum_t, which esp-modbus v2.1.2 maps to
+ *    a limited set of exceptions (no 0x03 Illegal Data Value).
+ *
+ * 2) Function-code handler override (mbc_set_handler, a public API): for the
+ *    write function codes 0x06 and 0x10 we install wrapper handlers that
+ *    return mb_exception_t DIRECTLY, so they can emit ANY exception code,
+ *    including 0x03 Illegal Data Value. They validate the request, and on
+ *    success delegate to the saved default handler (which performs the write
+ *    through the callback above).
  */
 
 /* Demo validation policy (tweak as needed). */
 #define MB_HOLDING_READONLY_MASK  (1u << 0)   /* register 0 is read-only over Modbus */
 #define MB_HOLDING_MAX_VALUE      1000        /* reject writes above this value       */
+
+#define MB_FC_WRITE_SINGLE_HOLDING  0x06
+#define MB_FC_WRITE_MULTI_HOLDING   0x10
+
+/* PDU layout (Modbus standard): function code at offset 0, data at offset 1. */
+#define MB_PDU_DATA_OFF             1
+
+/* Validate one holding-register write; returns the exception to send (or
+ * MB_EX_NONE if the value is acceptable). This is the single source of truth
+ * for the write policy, shared by both write handlers. */
+static mb_exception_t validate_holding_write(uint16_t idx, uint16_t val)
+{
+    if (idx >= MB_HOLDING_CNT) {
+        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 */
+    }
+    if (MB_HOLDING_READONLY_MASK & (1u << idx)) {
+        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 (register is read-only) */
+    }
+    if (val > MB_HOLDING_MAX_VALUE) {
+        return MB_EX_ILLEGAL_DATA_VALUE;          /* 0x03 (the goal of this path) */
+    }
+    return MB_EX_NONE;
+}
+
+/* Saved default write handlers, delegated to after validation passes. */
+static mb_fn_handler_fp s_def_write_single = NULL;
+static mb_fn_handler_fp s_def_write_multi  = NULL;
+
+/* Handler for 0x06 Write Single Holding Register. */
+static mb_exception_t fn_write_single_holding(void *inst, uint8_t *frame, uint16_t *len)
+{
+    uint16_t addr = ((uint16_t)frame[MB_PDU_DATA_OFF] << 8) | frame[MB_PDU_DATA_OFF + 1];
+    uint16_t val  = ((uint16_t)frame[MB_PDU_DATA_OFF + 2] << 8) | frame[MB_PDU_DATA_OFF + 3];
+
+    mb_exception_t ex = validate_holding_write(addr, val);
+    if (ex != MB_EX_NONE) {
+        ESP_LOGW(TAG, "0x06 reject reg %u val %u -> exception 0x%02x", addr, val, ex);
+        return ex;
+    }
+    return s_def_write_single ? s_def_write_single(inst, frame, len) : MB_EX_SLAVE_DEVICE_FAILURE;
+}
+
+/* Handler for 0x10 Write Multiple Holding Registers. */
+static mb_exception_t fn_write_multi_holding(void *inst, uint8_t *frame, uint16_t *len)
+{
+    uint16_t addr = ((uint16_t)frame[MB_PDU_DATA_OFF] << 8) | frame[MB_PDU_DATA_OFF + 1];
+    uint16_t cnt  = ((uint16_t)frame[MB_PDU_DATA_OFF + 2] << 8) | frame[MB_PDU_DATA_OFF + 3];
+    const uint8_t *values = &frame[MB_PDU_DATA_OFF + 5];   /* after byte-count field */
+
+    /* Address-range check first so the value loop stays bounded. */
+    if (addr >= MB_HOLDING_CNT || (uint32_t)addr + cnt > MB_HOLDING_CNT) {
+        ESP_LOGW(TAG, "0x10 reject range [%u..%u) -> 0x02", addr, addr + cnt);
+        return MB_EX_ILLEGAL_DATA_ADDRESS;
+    }
+    for (uint16_t i = 0; i < cnt; i++) {
+        uint16_t val = ((uint16_t)values[i * 2] << 8) | values[i * 2 + 1];
+        mb_exception_t ex = validate_holding_write((uint16_t)(addr + i), val);
+        if (ex != MB_EX_NONE) {
+            ESP_LOGW(TAG, "0x10 reject reg %u val %u -> exception 0x%02x", addr + i, val, ex);
+            return ex;
+        }
+    }
+    return s_def_write_multi ? s_def_write_multi(inst, frame, len) : MB_EX_SLAVE_DEVICE_FAILURE;
+}
+
+/* Install the custom write handlers on the current controller. Must run after
+ * the controller is (re)created, i.e. on every start / hot-switch. */
+static void install_custom_handlers(void)
+{
+    mbc_get_handler(s_mb_handle, MB_FC_WRITE_SINGLE_HOLDING, &s_def_write_single);
+    mbc_get_handler(s_mb_handle, MB_FC_WRITE_MULTI_HOLDING,  &s_def_write_multi);
+    ESP_ERROR_CHECK(mbc_set_handler(s_mb_handle, MB_FC_WRITE_SINGLE_HOLDING, fn_write_single_holding));
+    ESP_ERROR_CHECK(mbc_set_handler(s_mb_handle, MB_FC_WRITE_MULTI_HOLDING,  fn_write_multi_holding));
+}
 
 mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
                                        uint16_t address, uint16_t n_regs,
@@ -183,22 +257,8 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     }
 
     if (mode == MB_REG_WRITE) {
-        /* Validate the entire request first; commit nothing on failure. */
-        for (uint16_t i = 0; i < n_regs; i++) {
-            uint16_t idx = (uint16_t)(base + i);
-            uint16_t val = ((uint16_t)reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1];
-
-            if (MB_HOLDING_READONLY_MASK & (1u << idx)) {
-                ESP_LOGW(TAG, "Reject write to read-only holding reg %u", idx);
-                return MB_EINVAL;           /* -> 0x04 Slave Device Failure */
-            }
-            if (val > MB_HOLDING_MAX_VALUE) {
-                ESP_LOGW(TAG, "Reject holding reg %u value %u (> %u)",
-                         idx, val, MB_HOLDING_MAX_VALUE);
-                return MB_EINVAL;           /* -> 0x04 (0x03 not reachable here) */
-            }
-        }
-        /* Commit: Modbus frame is big-endian per register. */
+        /* Value/permission policy is enforced earlier by the 0x06/0x10
+         * handlers; here we just commit (big-endian frame -> host storage). */
         for (uint16_t i = 0; i < n_regs; i++) {
             s_holding_regs[base + i] =
                 ((uint16_t)reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1];
@@ -250,6 +310,7 @@ static void slave_start_locked(void)
 {
     slave_create(&s_cfg);
     register_descriptors();
+    install_custom_handlers();
     ESP_ERROR_CHECK(mbc_slave_start(s_mb_handle));
     ESP_LOGI(TAG, "Slave running: %s addr=%d", mode_str(s_cfg.mode), s_cfg.slave_addr);
 }
