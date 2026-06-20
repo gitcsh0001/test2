@@ -48,8 +48,10 @@ static const char *mode_str(slave_mode_t m) { return m == MODE_RTU ? "RTU" : "TC
  *                                                  (P > 0 import, P < 0 export)
  *   [2,3] Export limit (W)         int32   R/W    anti-backflow threshold
  *                                                  (max allowed export, >= 0)
- *   [4]   Master heartbeat         uint16  R/W    master increments to pet
- *                                                  the comms watchdog
+ *   [4]   Command / acknowledge     uint16  R/W    write 0xAC5A to clear a
+ *                                                  latched fail-safe (when no
+ *                                                  fault is active). Any access
+ *                                                  also feeds the watchdog.
  *   [5]   Status flags             uint16  READ   bit0 fail-safe, bit1 reverse
  *
  * NOTE: power is exposed in watts as a signed integer. Apply any scaling on
@@ -66,6 +68,8 @@ static const char *mode_str(slave_mode_t m) { return m == MODE_RTU ? "RTU" : "TC
 #define STATUS_FAILSAFE (1u << 0)   /* fail-safe output asserted (trip)        */
 #define STATUS_REVERSE  (1u << 1)   /* reverse power flow over the limit       */
 
+#define MB_FAILSAFE_ACK_CMD  0xAC5A /* master writes this to [4] to clear latch */
+
 static uint16_t s_holding_regs[MB_HOLDING_CNT];
 
 /* Short critical sections protect the register array against torn reads of
@@ -78,7 +82,8 @@ static void           *s_mb_handle = NULL;
 static slave_cfg_t      s_cfg;
 static SemaphoreHandle_t s_lock;
 static volatile bool    s_net_up = false;
-static volatile int64_t s_last_access_us = 0;   /* last master read/write     */
+static int64_t          s_last_access_us = 0;    /* last master access (s_reg_mux) */
+static bool             s_ever_polled = false;    /* master polled at least once    */
 
 /* Slave response timeout for the TCP transport (ms). */
 #define MB_TCP_RESPONSE_TOUT_MS  1000
@@ -356,7 +361,11 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     }
 
     /* Record master activity for the communication watchdog. */
-    s_last_access_us = esp_timer_get_time();
+    int64_t access_now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_reg_mux);
+    s_last_access_us = access_now;
+    s_ever_polled = true;
+    taskEXIT_CRITICAL(&s_reg_mux);
 
     if (mode == MB_REG_WRITE) {
         /* Value/permission policy is enforced earlier by the 0x06/0x10
@@ -507,29 +516,52 @@ static void failsafe_gpio_init(void)
 static void control_task(void *arg)
 {
     (void)arg;
-    const int64_t wd_us = (int64_t)CONFIG_MB_WATCHDOG_TIMEOUT_MS * 1000;
+    const int64_t wd_us  = (int64_t)CONFIG_MB_WATCHDOG_TIMEOUT_MS * 1000;
+    const int32_t hyst   = CONFIG_MB_REVERSE_HYSTERESIS_W;
+    bool reverse = false;      /* hysteresis state                          */
+    bool latched = false;      /* fail-safe latch state                     */
+    bool prev_trip = true;     /* boot state is SAFE (asserted)             */
 
     while (1) {
         int32_t p = read_meter_active_power();
 
+        /* Snapshot shared registers / supervision under the lock. */
+        int64_t now = esp_timer_get_time();
         taskENTER_CRITICAL(&s_reg_mux);
         reg_set_i32(REG_P_HI, p);
         int32_t limit = reg_get_i32(REG_LIMIT_HI);
+        int64_t last  = s_last_access_us;
+        bool ever     = s_ever_polled;
+        uint16_t cmd  = s_holding_regs[REG_HEARTBEAT];
         taskEXIT_CRITICAL(&s_reg_mux);
         if (limit < 0) {
             limit = 0;
         }
 
-        /* Reverse flow = export (P < 0) whose magnitude exceeds the limit. */
-        bool reverse = (p < 0) && (-p > limit);
+        /* Reverse flow with hysteresis: trip at >limit, clear below limit-hyst. */
+        if (!reverse) {
+            reverse = (p < 0) && (-p > limit);
+        } else if (p >= 0 || -p <= (limit - hyst)) {
+            reverse = false;
+        }
 
-        /* Comms lost if offline or the master has not polled within timeout. */
-        int64_t now = esp_timer_get_time();
-        bool comms_lost = !s_net_up ||
-                          (s_last_access_us != 0 && (now - s_last_access_us) > wd_us);
+        /* Comms lost if offline, never polled yet, or polled too long ago.
+         * (No supervision == not safe, so untrip only after the first poll.) */
+        bool comms_lost = !s_net_up || !ever || ((now - last) > wd_us);
 
-        /* Fail safe (trip) on either reverse flow or lost supervision. */
-        bool trip = reverse || comms_lost;
+        bool fault = reverse || comms_lost;
+        bool trip;
+#if CONFIG_MB_FAILSAFE_LATCH
+        if (fault) {
+            latched = true;
+        } else if (cmd == MB_FAILSAFE_ACK_CMD) {
+            latched = false;            /* master acknowledged, no active fault */
+        }
+        trip = latched;
+#else
+        (void)latched; (void)cmd;
+        trip = fault;
+#endif
 
         uint16_t st = 0;
         if (trip)    st |= STATUS_FAILSAFE;
@@ -537,15 +569,19 @@ static void control_task(void *arg)
 
         taskENTER_CRITICAL(&s_reg_mux);
         s_holding_regs[REG_STATUS] = st;
+#if CONFIG_MB_FAILSAFE_LATCH
+        if (cmd == MB_FAILSAFE_ACK_CMD) {
+            s_holding_regs[REG_HEARTBEAT] = 0;   /* consume the ack command */
+        }
+#endif
         taskEXIT_CRITICAL(&s_reg_mux);
 
         failsafe_output(trip);
 
-        static bool s_prev_trip = false;
-        if (trip != s_prev_trip) {
+        if (trip != prev_trip) {
             ESP_LOGW(TAG, "Fail-safe %s (P=%d W, limit=%d W, reverse=%d, comms_lost=%d)",
                      trip ? "TRIP" : "clear", p, limit, reverse, comms_lost);
-            s_prev_trip = trip;
+            prev_trip = trip;
         }
 
         vTaskDelay(pdMS_TO_TICKS(200));

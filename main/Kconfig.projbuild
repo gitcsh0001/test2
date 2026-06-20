@@ -64,6 +64,26 @@ menu "Modbus Slave Configuration"
         help
             If the master does not read/write within this time the slave
             trips the fail-safe output. Set above the master poll period.
+            The watchdog is also considered tripped until the first master
+            access after boot (no supervision == not safe).
+
+    config MB_REVERSE_HYSTERESIS_W
+        int "Reverse-flow clear hysteresis (W)"
+        range 0 100000
+        default 50
+        help
+            Reverse flow trips when export exceeds the limit, and only clears
+            once export drops below (limit - this value). Prevents fail-safe
+            output chatter when power hovers around the limit.
+
+    config MB_FAILSAFE_LATCH
+        bool "Latch the fail-safe output until acknowledged"
+        default n
+        help
+            When enabled, a trip latches and stays asserted even after the
+            cause clears. The master clears it by writing the acknowledge
+            command (0xAC5A) to the command register [4], and only when no
+            fault is currently active.
 
     config MB_FAILSAFE_GPIO
         int "Fail-safe output GPIO (-1 to disable)"
