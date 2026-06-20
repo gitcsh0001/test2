@@ -1,0 +1,6 @@
+## Managed component dependencies for the Modbus slave example.
+## See https://components.espressif.com/components/espressif/esp-modbus
+dependencies:
+  espressif/esp-modbus: "==2.1.2"
+  idf:
+    version: ">=6.0"

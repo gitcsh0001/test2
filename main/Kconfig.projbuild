@@ -1,0 +1,121 @@
+menu "Modbus Slave Configuration"
+
+    comment "These are factory defaults; all values can be changed at"
+    comment "runtime from the web UI and are then persisted in NVS."
+
+    config MB_SLAVE_ADDR
+        int "Default Modbus slave address (UID)"
+        range 1 247
+        default 1
+
+    choice MB_SLAVE_INIT_MODE
+        prompt "Default communication mode"
+        default MB_SLAVE_INIT_RTU
+        help
+            Mode used on first boot (before any web configuration is saved).
+            At runtime the web UI can switch between RTU and TCP and edit all
+            parameters; both transports are always compiled in.
+
+        config MB_SLAVE_INIT_RTU
+            bool "Modbus RTU (serial)"
+        config MB_SLAVE_INIT_TCP
+            bool "Modbus TCP (network)"
+    endchoice
+
+    comment "--- RTU defaults ---"
+
+    config MB_SLAVE_UART_PORT_NUM
+        int "Default UART port number"
+        range 0 2
+        default 1
+        help
+            TXD / RXD / RTS pins are set under
+            "Component config -> Modbus configuration".
+
+    config MB_SLAVE_UART_BAUD
+        int "Default UART baud rate"
+        range 1200 921600
+        default 115200
+
+    comment "--- TCP defaults ---"
+
+    config MB_SLAVE_TCP_PORT
+        int "Default Modbus TCP port"
+        range 1 65535
+        default 502
+        help
+            Wi-Fi / Ethernet credentials are set under
+            "Example Connection Configuration".
+
+    comment "--- Anti-backflow / data model ---"
+
+    config MB_REG_WORD_SWAP
+        bool "Swap word order of 32-bit registers (CDAB)"
+        default n
+        help
+            32-bit values span two holding registers. Default is big-word
+            first (ABCD). Enable this for masters that expect the low word
+            first (CDAB / word-swapped).
+
+    config MB_WATCHDOG_TIMEOUT_MS
+        int "Communication watchdog timeout (ms)"
+        range 200 60000
+        default 3000
+        help
+            If the master does not read/write within this time the slave
+            trips the fail-safe output. Set above the master poll period.
+            The watchdog is also considered tripped until the first master
+            access after boot (no supervision == not safe).
+
+    config MB_REVERSE_HYSTERESIS_W
+        int "Reverse-flow clear hysteresis (W)"
+        range 0 100000
+        default 50
+        help
+            Reverse flow trips when export exceeds the limit, and only clears
+            once export drops below (limit - this value). Prevents fail-safe
+            output chatter when power hovers around the limit.
+
+    config MB_FAILSAFE_LATCH
+        bool "Latch the fail-safe output until acknowledged"
+        default n
+        help
+            When enabled, a trip latches and stays asserted even after the
+            cause clears. The master clears it by writing the acknowledge
+            command (0xAC5A) to the command register [4], and only when no
+            fault is currently active.
+
+    config MB_FAILSAFE_GPIO
+        int "Fail-safe output GPIO (-1 to disable)"
+        range -1 48
+        default 4
+        help
+            GPIO driven high to command the safe state (curtail / disable
+            export) on reverse flow or lost supervision. Wire it to the
+            inverter enable / a trip relay. Set to -1 to disable.
+
+    comment "--- Web UI security ---"
+
+    config MB_WEB_AUTH_ENABLE
+        bool "Require a token to change configuration"
+        default y
+        help
+            When enabled, POST /api/config must include the access token
+            below. Protects the runtime configuration of grid-connected gear.
+
+    config MB_WEB_AUTH_TOKEN
+        string "Web access token"
+        default "changeme"
+        depends on MB_WEB_AUTH_ENABLE
+        help
+            Shared secret the web UI must send to apply configuration changes.
+            CHANGE THIS before deployment.
+
+    config MB_LOCK_TRANSPORT
+        bool "Lock transport (forbid RTU/TCP hot-switch at runtime)"
+        default n
+        help
+            When enabled, the web UI may edit parameters but cannot change the
+            transport at runtime. Recommended once commissioned.
+
+endmenu

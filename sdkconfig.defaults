@@ -1,0 +1,13 @@
+# ---- Project build defaults (applied by idf.py) ----
+
+# --- Modbus TCP connection-layer robustness ---
+# Max simultaneous master connections the TCP slave accepts.
+CONFIG_FMB_TCP_PORT_MAX_CONN=5
+# Drop a connection that stays idle longer than this (frees the socket slot).
+CONFIG_FMB_TCP_CONNECTION_TOUT_SEC=20
+# TCP keep-alive: detect and reap dead peers so sockets are not leaked.
+CONFIG_FMB_TCP_KEEP_ALIVE_TOUT_SEC=4
+
+# --- Wi-Fi: keep the slave reachable ---
+# Reconnect to the AP forever on disconnect (-1 disables the retry cap).
+CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=-1
