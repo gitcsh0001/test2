@@ -38,6 +38,11 @@ esp_err_t modbus_apply_config(const slave_cfg_t *cfg);
  * Reflects Wi-Fi link state for the TCP transport and web UI. */
 bool modbus_net_is_up(void);
 
+/* Anti-backflow telemetry (thread-safe snapshots). */
+int32_t  modbus_power_w(void);   /* measured active power, W (>0 import, <0 export) */
+int32_t  modbus_limit_w(void);   /* configured export limit, W                     */
+uint16_t modbus_status(void);    /* status flags: bit0 fail-safe, bit1 reverse     */
+
 #ifdef __cplusplus
 }
 #endif

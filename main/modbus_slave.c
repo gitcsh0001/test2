@@ -22,7 +22,9 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "mbcontroller.h"
 #include "mb_types.h"          /* mb_err_enum_t, mb_reg_mode_enum_t, exceptions */
 #include "protocol_examples_common.h"
@@ -37,11 +39,38 @@ static const char *TAG = "mb_slave";
 
 static const char *mode_str(slave_mode_t m) { return m == MODE_RTU ? "RTU" : "TCP"; }
 
-/* ---- Register storage ------------------------------------------------- */
+/* ---- Holding register map (anti-backflow meter node) ------------------
+ *
+ * Holding registers (16-bit each). 32-bit values span two registers; their
+ * word order follows CONFIG_MB_REG_WORD_SWAP (big-word-first by default).
+ *
+ *   [0,1] Active power P (W)       int32   READ   measured, signed
+ *                                                  (P > 0 import, P < 0 export)
+ *   [2,3] Export limit (W)         int32   R/W    anti-backflow threshold
+ *                                                  (max allowed export, >= 0)
+ *   [4]   Master heartbeat         uint16  R/W    master increments to pet
+ *                                                  the comms watchdog
+ *   [5]   Status flags             uint16  READ   bit0 fail-safe, bit1 reverse
+ *
+ * NOTE: power is exposed in watts as a signed integer. Apply any scaling on
+ * the master side as agreed for your deployment.
+ */
+#define REG_P_HI        0
+#define REG_P_LO        1
+#define REG_LIMIT_HI    2
+#define REG_LIMIT_LO    3
+#define REG_HEARTBEAT   4
+#define REG_STATUS      5
+#define MB_HOLDING_CNT  6
 
-#define MB_HOLDING_CNT   10
+#define STATUS_FAILSAFE (1u << 0)   /* fail-safe output asserted (trip)        */
+#define STATUS_REVERSE  (1u << 1)   /* reverse power flow over the limit       */
 
 static uint16_t s_holding_regs[MB_HOLDING_CNT];
+
+/* Short critical sections protect the register array against torn reads of
+ * multi-register (32-bit) values shared with the measurement/watchdog tasks. */
+static portMUX_TYPE s_reg_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- State ------------------------------------------------------------ */
 
@@ -49,9 +78,64 @@ static void           *s_mb_handle = NULL;
 static slave_cfg_t      s_cfg;
 static SemaphoreHandle_t s_lock;
 static volatile bool    s_net_up = false;
+static volatile int64_t s_last_access_us = 0;   /* last master read/write     */
 
 /* Slave response timeout for the TCP transport (ms). */
 #define MB_TCP_RESPONSE_TOUT_MS  1000
+
+/* ---- 32-bit register helpers (honor configured word order) ------------ */
+
+static void reg_set_i32(int idx_hi, int32_t v)
+{
+    uint16_t hi = (uint16_t)((uint32_t)v >> 16);
+    uint16_t lo = (uint16_t)((uint32_t)v & 0xFFFF);
+#if CONFIG_MB_REG_WORD_SWAP
+    s_holding_regs[idx_hi]     = lo;
+    s_holding_regs[idx_hi + 1] = hi;
+#else
+    s_holding_regs[idx_hi]     = hi;
+    s_holding_regs[idx_hi + 1] = lo;
+#endif
+}
+
+static int32_t reg_get_i32(int idx_hi)
+{
+    uint16_t a = s_holding_regs[idx_hi];
+    uint16_t b = s_holding_regs[idx_hi + 1];
+#if CONFIG_MB_REG_WORD_SWAP
+    return (int32_t)(((uint32_t)b << 16) | a);
+#else
+    return (int32_t)(((uint32_t)a << 16) | b);
+#endif
+}
+
+/* Telemetry accessors (used by the web UI). */
+int32_t modbus_power_w(void)
+{
+    int32_t v;
+    taskENTER_CRITICAL(&s_reg_mux);
+    v = reg_get_i32(REG_P_HI);
+    taskEXIT_CRITICAL(&s_reg_mux);
+    return v;
+}
+
+int32_t modbus_limit_w(void)
+{
+    int32_t v;
+    taskENTER_CRITICAL(&s_reg_mux);
+    v = reg_get_i32(REG_LIMIT_HI);
+    taskEXIT_CRITICAL(&s_reg_mux);
+    return v;
+}
+
+uint16_t modbus_status(void)
+{
+    uint16_t v;
+    taskENTER_CRITICAL(&s_reg_mux);
+    v = s_holding_regs[REG_STATUS];
+    taskEXIT_CRITICAL(&s_reg_mux);
+    return v;
+}
 
 bool modbus_net_is_up(void)
 {
@@ -146,9 +230,12 @@ static void register_descriptors(void)
 
 static void seed_values(void)
 {
-    for (int i = 0; i < MB_HOLDING_CNT; i++) {
-        s_holding_regs[i] = i;
-    }
+    taskENTER_CRITICAL(&s_reg_mux);
+    reg_set_i32(REG_P_HI, 0);                       /* measured power = 0 W   */
+    reg_set_i32(REG_LIMIT_HI, 0);                   /* strict: 0 W export     */
+    s_holding_regs[REG_HEARTBEAT] = 0;
+    s_holding_regs[REG_STATUS]    = 0;
+    taskEXIT_CRITICAL(&s_reg_mux);
 }
 
 /* ---- Custom holding-register handling ---------------------------------
@@ -170,31 +257,33 @@ static void seed_values(void)
  *    through the callback above).
  */
 
-/* Demo validation policy (tweak as needed). */
-#define MB_HOLDING_READONLY_MASK  (1u << 0)   /* register 0 is read-only over Modbus */
-#define MB_HOLDING_MAX_VALUE      1000        /* reject writes above this value       */
-
 #define MB_FC_WRITE_SINGLE_HOLDING  0x06
 #define MB_FC_WRITE_MULTI_HOLDING   0x10
 
 /* PDU layout (Modbus standard): function code at offset 0, data at offset 1. */
 #define MB_PDU_DATA_OFF             1
 
-/* Validate one holding-register write; returns the exception to send (or
- * MB_EX_NONE if the value is acceptable). This is the single source of truth
- * for the write policy, shared by both write handlers. */
+/* Metering write policy: measurement and status registers are read-only to
+ * the master; only the export-limit setpoint and the heartbeat are writable.
+ * Single source of truth for both write handlers. */
 static mb_exception_t validate_holding_write(uint16_t idx, uint16_t val)
 {
+    (void)val;
     if (idx >= MB_HOLDING_CNT) {
-        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 */
+        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 out of range        */
     }
-    if (MB_HOLDING_READONLY_MASK & (1u << idx)) {
-        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 (register is read-only) */
+    switch (idx) {
+    case REG_P_HI:
+    case REG_P_LO:
+    case REG_STATUS:
+        return MB_EX_ILLEGAL_DATA_ADDRESS;        /* 0x02 read-only to master  */
+    case REG_LIMIT_HI:
+    case REG_LIMIT_LO:
+    case REG_HEARTBEAT:
+        return MB_EX_NONE;                        /* writable                  */
+    default:
+        return MB_EX_ILLEGAL_DATA_ADDRESS;
     }
-    if (val > MB_HOLDING_MAX_VALUE) {
-        return MB_EX_ILLEGAL_DATA_VALUE;          /* 0x03 (the goal of this path) */
-    }
-    return MB_EX_NONE;
 }
 
 /* Saved default write handlers, delegated to after validation passes. */
@@ -266,20 +355,27 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
         return MB_ENOREG;
     }
 
+    /* Record master activity for the communication watchdog. */
+    s_last_access_us = esp_timer_get_time();
+
     if (mode == MB_REG_WRITE) {
         /* Value/permission policy is enforced earlier by the 0x06/0x10
          * handlers; here we just commit (big-endian frame -> host storage). */
+        taskENTER_CRITICAL(&s_reg_mux);
         for (uint16_t i = 0; i < n_regs; i++) {
             s_holding_regs[base + i] =
                 ((uint16_t)reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1];
         }
+        taskEXIT_CRITICAL(&s_reg_mux);
         ESP_LOGI(TAG, "Holding WR ok: base=%u n=%u", base, n_regs);
     } else { /* MB_REG_READ */
+        taskENTER_CRITICAL(&s_reg_mux);
         for (uint16_t i = 0; i < n_regs; i++) {
             uint16_t val = s_holding_regs[base + i];
             reg_buffer[i * 2]     = (uint8_t)(val >> 8);
             reg_buffer[i * 2 + 1] = (uint8_t)(val & 0xFF);
         }
+        taskEXIT_CRITICAL(&s_reg_mux);
         ESP_LOGI(TAG, "Holding RD: base=%u n=%u", base, n_regs);
     }
     return MB_ENOERR;
@@ -364,6 +460,98 @@ esp_err_t modbus_apply_config(const slave_cfg_t *cfg)
 
 /* ---- Boot ------------------------------------------------------------- */
 
+/* ---- Measurement + anti-backflow watchdog / fail-safe ----------------- */
+
+/* Read the meter's active power in watts (P > 0 import, P < 0 export).
+ *
+ * DEMO: a slow oscillation that crosses zero so reverse flow is observable.
+ * REPLACE this with a real reading from your meter (e.g. a metering chip,
+ * an analog front-end, or another Modbus device). */
+static int32_t read_meter_active_power(void)
+{
+    int64_t t_ms = esp_timer_get_time() / 1000;
+    /* +/-2000 W triangle-ish wave, ~20 s period. */
+    int32_t phase = (int32_t)(t_ms % 20000) - 10000;     /* -10000..+10000 */
+    return phase / 5;                                    /* -2000..+2000 W */
+}
+
+/* Drive the fail-safe output (e.g. relay / inverter enable). Asserted = trip
+ * to the safe state (curtail / disable export). */
+static void failsafe_output(bool trip)
+{
+#if CONFIG_MB_FAILSAFE_GPIO >= 0
+    gpio_set_level((gpio_num_t)CONFIG_MB_FAILSAFE_GPIO, trip ? 1 : 0);
+#else
+    (void)trip;
+#endif
+}
+
+static void failsafe_gpio_init(void)
+{
+#if CONFIG_MB_FAILSAFE_GPIO >= 0
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << CONFIG_MB_FAILSAFE_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    failsafe_output(true);   /* default to the SAFE state until proven OK */
+    ESP_LOGI(TAG, "Fail-safe output on GPIO%d (asserted at boot)", CONFIG_MB_FAILSAFE_GPIO);
+#endif
+}
+
+/* Periodic control loop: refresh measured power, evaluate reverse flow and
+ * comms health, and drive the fail-safe output. Runs regardless of transport. */
+static void control_task(void *arg)
+{
+    (void)arg;
+    const int64_t wd_us = (int64_t)CONFIG_MB_WATCHDOG_TIMEOUT_MS * 1000;
+
+    while (1) {
+        int32_t p = read_meter_active_power();
+
+        taskENTER_CRITICAL(&s_reg_mux);
+        reg_set_i32(REG_P_HI, p);
+        int32_t limit = reg_get_i32(REG_LIMIT_HI);
+        taskEXIT_CRITICAL(&s_reg_mux);
+        if (limit < 0) {
+            limit = 0;
+        }
+
+        /* Reverse flow = export (P < 0) whose magnitude exceeds the limit. */
+        bool reverse = (p < 0) && (-p > limit);
+
+        /* Comms lost if offline or the master has not polled within timeout. */
+        int64_t now = esp_timer_get_time();
+        bool comms_lost = !s_net_up ||
+                          (s_last_access_us != 0 && (now - s_last_access_us) > wd_us);
+
+        /* Fail safe (trip) on either reverse flow or lost supervision. */
+        bool trip = reverse || comms_lost;
+
+        uint16_t st = 0;
+        if (trip)    st |= STATUS_FAILSAFE;
+        if (reverse) st |= STATUS_REVERSE;
+
+        taskENTER_CRITICAL(&s_reg_mux);
+        s_holding_regs[REG_STATUS] = st;
+        taskEXIT_CRITICAL(&s_reg_mux);
+
+        failsafe_output(trip);
+
+        static bool s_prev_trip = false;
+        if (trip != s_prev_trip) {
+            ESP_LOGW(TAG, "Fail-safe %s (P=%d W, limit=%d W, reverse=%d, comms_lost=%d)",
+                     trip ? "TRIP" : "clear", p, limit, reverse, comms_lost);
+            s_prev_trip = trip;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
 /* Track link state so the TCP transport health is visible (web UI / logs).
  * example_connect() already drives Wi-Fi auto-reconnect; we only observe it. */
 static void net_event_handler(void *arg, esp_event_base_t base,
@@ -406,6 +594,8 @@ void app_main(void)
 {
     s_lock = xSemaphoreCreateMutex();
 
+    failsafe_gpio_init();       /* assert safe state before anything else  */
+
     network_connect();          /* Wi-Fi up first (web UI + optional TCP) */
 
     seed_values();
@@ -414,6 +604,9 @@ void app_main(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     slave_start_locked();
     xSemaphoreGive(s_lock);
+
+    /* Anti-backflow control / fail-safe loop. */
+    xTaskCreate(control_task, "mb_control", 3072, NULL, 6, NULL);
 
     web_server_start();         /* serves UI + /api/status + /api/config  */
 

@@ -47,4 +47,55 @@ menu "Modbus Slave Configuration"
             Wi-Fi / Ethernet credentials are set under
             "Example Connection Configuration".
 
+    comment "--- Anti-backflow / data model ---"
+
+    config MB_REG_WORD_SWAP
+        bool "Swap word order of 32-bit registers (CDAB)"
+        default n
+        help
+            32-bit values span two holding registers. Default is big-word
+            first (ABCD). Enable this for masters that expect the low word
+            first (CDAB / word-swapped).
+
+    config MB_WATCHDOG_TIMEOUT_MS
+        int "Communication watchdog timeout (ms)"
+        range 200 60000
+        default 3000
+        help
+            If the master does not read/write within this time the slave
+            trips the fail-safe output. Set above the master poll period.
+
+    config MB_FAILSAFE_GPIO
+        int "Fail-safe output GPIO (-1 to disable)"
+        range -1 48
+        default 4
+        help
+            GPIO driven high to command the safe state (curtail / disable
+            export) on reverse flow or lost supervision. Wire it to the
+            inverter enable / a trip relay. Set to -1 to disable.
+
+    comment "--- Web UI security ---"
+
+    config MB_WEB_AUTH_ENABLE
+        bool "Require a token to change configuration"
+        default y
+        help
+            When enabled, POST /api/config must include the access token
+            below. Protects the runtime configuration of grid-connected gear.
+
+    config MB_WEB_AUTH_TOKEN
+        string "Web access token"
+        default "changeme"
+        depends on MB_WEB_AUTH_ENABLE
+        help
+            Shared secret the web UI must send to apply configuration changes.
+            CHANGE THIS before deployment.
+
+    config MB_LOCK_TRANSPORT
+        bool "Lock transport (forbid RTU/TCP hot-switch at runtime)"
+        default n
+        help
+            When enabled, the web UI may edit parameters but cannot change the
+            transport at runtime. Recommended once commissioned.
+
 endmenu
