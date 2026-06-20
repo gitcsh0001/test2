@@ -23,6 +23,7 @@
 #include "esp_netif.h"
 #include "driver/uart.h"
 #include "mbcontroller.h"
+#include "mb_types.h"          /* mb_err_enum_t, mb_reg_mode_enum_t, exceptions */
 #include "protocol_examples_common.h"
 
 #include "modbus_slave.h"
@@ -138,6 +139,80 @@ static void seed_values(void)
     for (int i = 0; i < MB_HOLDING_CNT; i++) {
         s_holding_regs[i] = i;
     }
+}
+
+/* ---- Custom holding-register callback ---------------------------------
+ *
+ * esp-modbus declares mbc_reg_holding_slave_cb() as a WEAK symbol, so this
+ * strong definition overrides the library default at link time. It gives us
+ * full control over every master read/write of the holding area: we can
+ * validate values, enforce read-only registers and return Modbus exception
+ * codes to the master.
+ *
+ * Exception codes reachable from this callback (esp-modbus v2.1.2 maps the
+ * returned mb_err_enum_t via mb_error_to_exception()):
+ *     return MB_ENOERR     -> 0x00  OK
+ *     return MB_ENOREG     -> 0x02  Illegal Data Address
+ *     return MB_ETIMEDOUT  -> 0x06  Slave Busy
+ *     return <other>       -> 0x04  Slave Device Failure
+ * Note: 0x03 (Illegal Data Value) is NOT reachable from a register callback
+ * in this version; producing it would require replacing the whole function
+ * handler via the (private) mbs_set_handler() API.
+ */
+
+/* Demo validation policy (tweak as needed). */
+#define MB_HOLDING_READONLY_MASK  (1u << 0)   /* register 0 is read-only over Modbus */
+#define MB_HOLDING_MAX_VALUE      1000        /* reject writes above this value       */
+
+mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
+                                       uint16_t address, uint16_t n_regs,
+                                       mb_reg_mode_enum_t mode)
+{
+    (void)inst;
+    if (reg_buffer == NULL) {
+        return MB_EINVAL;
+    }
+
+    /* The stack passes a 1-based address; convert to a 0-based index. */
+    uint16_t base = (uint16_t)(address - 1);
+
+    /* Bounds check against our holding area -> 0x02 Illegal Data Address. */
+    if ((uint32_t)base + n_regs > MB_HOLDING_CNT) {
+        ESP_LOGW(TAG, "Holding out of range: [%u..%u)", base, base + n_regs);
+        return MB_ENOREG;
+    }
+
+    if (mode == MB_REG_WRITE) {
+        /* Validate the entire request first; commit nothing on failure. */
+        for (uint16_t i = 0; i < n_regs; i++) {
+            uint16_t idx = (uint16_t)(base + i);
+            uint16_t val = ((uint16_t)reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1];
+
+            if (MB_HOLDING_READONLY_MASK & (1u << idx)) {
+                ESP_LOGW(TAG, "Reject write to read-only holding reg %u", idx);
+                return MB_EINVAL;           /* -> 0x04 Slave Device Failure */
+            }
+            if (val > MB_HOLDING_MAX_VALUE) {
+                ESP_LOGW(TAG, "Reject holding reg %u value %u (> %u)",
+                         idx, val, MB_HOLDING_MAX_VALUE);
+                return MB_EINVAL;           /* -> 0x04 (0x03 not reachable here) */
+            }
+        }
+        /* Commit: Modbus frame is big-endian per register. */
+        for (uint16_t i = 0; i < n_regs; i++) {
+            s_holding_regs[base + i] =
+                ((uint16_t)reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1];
+        }
+        ESP_LOGI(TAG, "Holding WR ok: base=%u n=%u", base, n_regs);
+    } else { /* MB_REG_READ */
+        for (uint16_t i = 0; i < n_regs; i++) {
+            uint16_t val = s_holding_regs[base + i];
+            reg_buffer[i * 2]     = (uint8_t)(val >> 8);
+            reg_buffer[i * 2 + 1] = (uint8_t)(val & 0xFF);
+        }
+        ESP_LOGI(TAG, "Holding RD: base=%u n=%u", base, n_regs);
+    }
+    return MB_ENOERR;
 }
 
 static void slave_create(const slave_cfg_t *c)
